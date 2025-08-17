@@ -1,7 +1,32 @@
 use std::{io, sync::Arc};
+use ed25519::signature::SignerMut;
 use tokio::net::UdpSocket;
+use serde::Deserialize;
 
 pub mod reliable_broadcast;
+
+
+#[derive(Deserialize, Clone)]
+pub struct Config {
+    pub my_id: u16,
+    pub nodes: Vec<NodeConfig>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct NodeConfig {
+    pub id: u16,
+    pub address: String,
+    pub privkey: [u8; 32],
+}
+
+
+impl Config {
+    pub async fn load(filename: &str) -> io::Result<Config> {
+        let config_data = tokio::fs::read_to_string(filename).await?;
+        let config: Config = serde_json::from_str(&config_data)?;
+        return Ok(config);
+    }
+}
 
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
@@ -81,24 +106,34 @@ pub struct Message {
     pub id: Identifier,
     pub sender: u16,
     pub payload: MessageType,
-    // TODO: add proof
+    pub signature: [u8; 64],
 }
 
 impl Message {
-    pub fn new(id: Identifier, sender: u16, payload: MessageType) -> Self {
-        Self { id, sender, payload }
+    pub fn new(id: Identifier, sender: u16, payload: MessageType, privkey: &[u8; 32]) -> Self {
+        let mut signing_key = ed25519_dalek::SigningKey::from_bytes(privkey);
+        let mut message =  Self { id, sender, payload, signature: [0; 64] };
+        let sig = signing_key.sign(&message.to_header_and_payload_bytes());
+        message.signature = sig.to_bytes();
+        return message;
     }
     
-    pub fn to_bytes(&self) -> Vec<u8> {
+    fn to_header_and_payload_bytes(&self) -> Vec<u8> {
         let mut result = Vec::new();
         result.extend_from_slice(&self.id.to_bytes());
         result.extend_from_slice(&self.sender.to_be_bytes());
         result.extend_from_slice(&self.payload.to_bytes());
         result
     }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut result = self.to_header_and_payload_bytes();
+        result.extend_from_slice(&self.signature);
+        result
+    }
     
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, io::Error> {
-        if bytes.len() < 12 {
+        if bytes.len() < 12+64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData, 
                 "Message too short"
@@ -107,9 +142,16 @@ impl Message {
 
         let id = Identifier::from_bytes(bytes[0..10].try_into().unwrap());
         let sender: u16 = u16::from_be_bytes(bytes[10..12].try_into().unwrap());
-        let payload = MessageType::from_bytes(&bytes[12..])?;
+        let payload = MessageType::from_bytes(&bytes[12..bytes.len()-64])?;
+        let signature: [u8; 64] = bytes[bytes.len()-64..].try_into().unwrap();
         
-        Ok(Message::new(id, sender, payload))
+        Ok(Self {id, sender, payload, signature})
+    }
+
+    pub fn verify(&self, pubkey: ed25519_dalek::VerifyingKey) -> bool {
+        let data = self.to_header_and_payload_bytes();
+        let signature = ed25519::Signature::from_bytes(&self.signature);
+        pubkey.verify_strict(&data, &signature).is_ok()
     }
 }
 
