@@ -6,24 +6,21 @@ use crate::Identifier;
 #[derive(PartialEq, Eq)]
 pub struct Instance {
     pub id: Identifier,
+    pub my_id: u16,
     pub message: Option<Vec<u8>>,
     pub digest: Option<[u8; 32]>,
     pub echo_messages: HashSet<u16>,
     pub ready_messages: HashSet<u16>,
-    pub requesting: bool,
-    pub output_flag: bool
 }
 
 
 impl Instance {
-    pub fn new(id: Identifier) -> Self {
+    pub fn new(id: Identifier, my_id: u16) -> Self {
         Self {
-            id, message: None,
+            id, my_id, message: None,
             digest: None,
             echo_messages: HashSet::new(),
             ready_messages: HashSet::new(),
-            requesting: false,
-            output_flag: false
         }
     }
 }

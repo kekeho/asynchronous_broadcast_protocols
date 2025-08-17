@@ -33,14 +33,14 @@ impl Identifier {
 
 
 pub struct Instance {
-    pub reliable_broadcast_instances: reliable_broadcast::Instance
+    pub reliable_broadcast_instance: reliable_broadcast::Instance
 }
 
 
 impl Instance {
-    pub fn new(id: Identifier) -> Self {
+    pub fn new(id: Identifier, my_id: u16) -> Self {
         Self {
-            reliable_broadcast_instances: reliable_broadcast::Instance::new(id)
+            reliable_broadcast_instance: reliable_broadcast::Instance::new(id, my_id)
         }
     }
 }
@@ -79,23 +79,26 @@ impl MessageType {
 #[derive(Debug, Clone)]
 pub struct Message {
     pub id: Identifier,
+    pub sender: u16,
     pub payload: MessageType,
+    // TODO: add proof
 }
 
 impl Message {
-    pub fn new(id: Identifier, payload: MessageType) -> Self {
-        Self { id, payload }
+    pub fn new(id: Identifier, sender: u16, payload: MessageType) -> Self {
+        Self { id, sender, payload }
     }
     
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut result = Vec::new();
         result.extend_from_slice(&self.id.to_bytes());
+        result.extend_from_slice(&self.sender.to_be_bytes());
         result.extend_from_slice(&self.payload.to_bytes());
         result
     }
     
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, io::Error> {
-        if bytes.len() < 10 {
+        if bytes.len() < 12 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData, 
                 "Message too short"
@@ -103,9 +106,10 @@ impl Message {
         }
 
         let id = Identifier::from_bytes(bytes[0..10].try_into().unwrap());
-        let payload = MessageType::from_bytes(&bytes[10..])?;
+        let sender: u16 = u16::from_be_bytes(bytes[10..12].try_into().unwrap());
+        let payload = MessageType::from_bytes(&bytes[12..])?;
         
-        Ok(Message::new(id, payload))
+        Ok(Message::new(id, sender, payload))
     }
 }
 
