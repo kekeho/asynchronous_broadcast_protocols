@@ -8,27 +8,56 @@ use crate::{Config, Identifier, Message, MessageType};
 use super::types::{Instance, ReliableBroadcastMessage};
 
 
-pub async fn broadcast(id: Identifier, message: Vec<u8>, config: Config, socket: Arc<UdpSocket>) {
-    let my_node = config.nodes.iter().filter(|n| n.id == config.my_id).last().unwrap();
+async fn send_message_to_all(message: Message, config: &Config, socket: Arc<UdpSocket>) -> Result<(), io::Error> {
+    let destinations = config.get_all_addresses();
+    let message_bytes = message.to_bytes();
+    for dest in &destinations {
+        socket.send_to(&message_bytes, dest).await
+            .map_err(|e| io::Error::new(io::ErrorKind::NetworkDown, format!("Failed to send to {}: {}", dest, e)))?;
+    }
+    Ok(())
+}
+
+
+async fn send_message_to_node(message: Message, target_id: u16, config: &Config, socket: Arc<UdpSocket>) -> Result<(), io::Error> {
+    if let Some(node) = config.get_node(target_id) {
+        let message_bytes = message.to_bytes();
+        socket.send_to(&message_bytes, &node.address).await
+            .map_err(|e| io::Error::new(io::ErrorKind::NetworkDown, format!("Failed to send to {}: {}", node.address, e)))?;
+        Ok(())
+    } else {
+        Err(io::Error::new(io::ErrorKind::NotFound, format!("Node {} not found", target_id)))
+    }
+}
+
+
+pub async fn broadcast(id: Identifier, message: Vec<u8>, config: Config, socket: Arc<UdpSocket>) -> Result<(), io::Error> {
+    let my_node = config.get_my_node()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "My node not found in config"))?;
+    
     let message = Message::new(
         id,
         id.sender,
         MessageType::ReliableBroadcast(ReliableBroadcastMessage::Broadcast(message)),
         &my_node.privkey
     );
-    _ = socket.send_to(&message.to_bytes(), &my_node.address).await;
+    
+    socket.send_to(&message.to_bytes(), &my_node.address).await
+        .map_err(|e| io::Error::new(io::ErrorKind::NetworkDown, format!("Failed to send broadcast: {}", e)))?;
+    
+    Ok(())
 }
 
 
 pub async fn receive(mut instance: Instance, mut rx: mpsc::Receiver<Message>, config: &Config, socket: Arc<UdpSocket>) -> Result<Vec<u8>, io::Error> {
     let n = config.nodes.len();
     let t = calc_t(n);
-    let my_node = config.nodes.iter().filter(|n| n.id == config.my_id).last().unwrap();
+    let my_node = config.get_my_node()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "My node not found in config"))?;
 
     while let Some(message) = rx.recv().await {
         let rbc_message = match message.payload {
             MessageType::ReliableBroadcast(m) => m,
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown message")),
         };
 
         match rbc_message {
@@ -39,15 +68,7 @@ pub async fn receive(mut instance: Instance, mut rx: mpsc::Receiver<Message>, co
                     MessageType::ReliableBroadcast(ReliableBroadcastMessage::Send(m.clone())),
                     &my_node.privkey
                 );
-                let message_bytes = message.to_bytes();
-                let dest_addrs: Vec<String> = config.nodes.iter().map(|n| n.address.clone()).collect();
-                let cloned_socket = socket.clone();
-                tokio::spawn(async move {
-                    for dest in dest_addrs {
-                        _ = cloned_socket.send_to(&message_bytes, dest).await;
-                    }
-                });
-                
+                send_message_to_all(message, config, socket.clone()).await?;
             }
 
             ReliableBroadcastMessage::Send(m) => {
@@ -60,15 +81,7 @@ pub async fn receive(mut instance: Instance, mut rx: mpsc::Receiver<Message>, co
                         MessageType::ReliableBroadcast(ReliableBroadcastMessage::Echo(digest)),
                         &my_node.privkey,
                     );
-                    let message_bytes = message.to_bytes();
-                    let message_bytes = message.to_bytes();
-                    let dest_addrs: Vec<String> = config.nodes.iter().map(|n| n.address.clone()).collect();
-                    let cloned_socket = socket.clone();
-                    tokio::spawn(async move {
-                        for dest in dest_addrs {
-                            _ = cloned_socket.send_to(&message_bytes, dest).await;
-                        }
-                    });
+                    send_message_to_all(message, config, socket.clone()).await?;
                 }
             }
 
@@ -83,14 +96,7 @@ pub async fn receive(mut instance: Instance, mut rx: mpsc::Receiver<Message>, co
                         MessageType::ReliableBroadcast(ReliableBroadcastMessage::Ready(d.clone())),
                         &my_node.privkey,
                     );
-                    let message_bytes = message.to_bytes();
-                    let dest_addrs: Vec<String> = config.nodes.iter().map(|n| n.address.clone()).collect();
-                    let cloned_socket = socket.clone();
-                    tokio::spawn(async move {
-                        for dest in dest_addrs {
-                            _ = cloned_socket.send_to(&message_bytes, dest).await;
-                        }
-                    });
+                    send_message_to_all(message, config, socket.clone()).await?;
                 }
             }
 
@@ -105,14 +111,7 @@ pub async fn receive(mut instance: Instance, mut rx: mpsc::Receiver<Message>, co
                         MessageType::ReliableBroadcast(ReliableBroadcastMessage::Ready(d.clone())),
                         &my_node.privkey,
                     );
-                    let message_bytes = message.to_bytes();
-                    let dest_addrs: Vec<String> = config.nodes.iter().map(|n| n.address.clone()).collect();
-                    let cloned_socket = socket.clone();
-                    tokio::spawn(async move {
-                        for dest in dest_addrs {
-                            _ = cloned_socket.send_to(&message_bytes, dest).await;
-                        }
-                    });
+                    send_message_to_all(message, config, socket.clone()).await?;
                 } else if instance.ready_messages.len() == 2*t+1 {
                     instance.digest = Some(d.clone());
                     let m_digest: [u8; 32] = Sha256::digest(instance.message.as_ref().unwrap()).into();
@@ -123,20 +122,21 @@ pub async fn receive(mut instance: Instance, mut rx: mpsc::Receiver<Message>, co
                             MessageType::ReliableBroadcast(ReliableBroadcastMessage::Request),
                             &my_node.privkey,
                         );
+                        
+                        // Send to first 2*t+1 nodes for request
+                        let request_targets: Vec<String> = config.nodes.iter()
+                            .take(2*t+1)
+                            .map(|n| n.address.clone())
+                            .collect();
                         let message_bytes = message.to_bytes();
-                        let dest_addrs: Vec<String> = config.nodes[..2*t+1].iter().map(|n| n.address.clone()).collect();
-                        let cloned_socket = socket.clone();
-                        tokio::spawn(async move {
-                            for dest in dest_addrs {
-                                _ = cloned_socket.send_to(&message_bytes, dest).await;
-                            }
-                        });
+                        for dest in request_targets {
+                            socket.send_to(&message_bytes, &dest).await?;
+                        }
 
                         // Wait for answers
                         while let Some(message) = rx.recv().await {
                             let rbc_message = match message.payload {
                                 MessageType::ReliableBroadcast(m) => m,
-                                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown message")),
                             };
                             match rbc_message {
                                 ReliableBroadcastMessage::Answer(m) => {
@@ -165,18 +165,15 @@ pub async fn receive(mut instance: Instance, mut rx: mpsc::Receiver<Message>, co
                         MessageType::ReliableBroadcast(ReliableBroadcastMessage::Answer(m.clone())),
                         &my_node.privkey,
                     );
-                    let message_bytes = message.to_bytes();
-                    let dest_addr: String = config.nodes.iter().filter(|n| n.id == from).last().unwrap().address.clone();
-                    let cloned_socket = socket.clone();
-                    tokio::spawn(async move {
-                        _ = cloned_socket.send_to(&message_bytes, dest_addr).await;
-                    });
+                    send_message_to_node(message, from, config, socket.clone()).await?;
                 }
             }
-            _ => {}
+            ReliableBroadcastMessage::Answer(_) => {
+                // Handled in the request response loop above
+            }
         }
     }
-    return Err(io::Error::new(io::ErrorKind::NetworkDown, ""));
+    Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Channel closed"))
 }
 
 

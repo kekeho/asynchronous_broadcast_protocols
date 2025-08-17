@@ -4,6 +4,9 @@ use tokio::net::UdpSocket;
 use serde::Deserialize;
 
 pub mod reliable_broadcast;
+pub mod constants;
+
+use constants::*;
 
 
 #[derive(Deserialize, Clone)]
@@ -24,7 +27,22 @@ impl Config {
     pub async fn load(filename: &str) -> io::Result<Config> {
         let config_data = tokio::fs::read_to_string(filename).await?;
         let config: Config = serde_json::from_str(&config_data)?;
-        return Ok(config);
+        Ok(config)
+    }
+
+    /// 指定されたIDのノード設定を取得
+    pub fn get_node(&self, id: u16) -> Option<&NodeConfig> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    /// 自分のノード設定を取得
+    pub fn get_my_node(&self) -> Option<&NodeConfig> {
+        self.get_node(self.my_id)
+    }
+
+    /// 全ノードのアドレスリストを取得
+    pub fn get_all_addresses(&self) -> Vec<String> {
+        self.nodes.iter().map(|n| n.address.clone()).collect()
     }
 }
 
@@ -41,17 +59,17 @@ impl Identifier {
         Self { sender, sequence }
     }
 
-    fn to_bytes(&self) -> [u8; 10] {
-        let mut result: [u8; 10] = [0; 10];
+    fn to_bytes(&self) -> [u8; IDENTIFIER_SIZE] {
+        let mut result: [u8; IDENTIFIER_SIZE] = [0; IDENTIFIER_SIZE];
         result[0..2].copy_from_slice(&self.sender.to_be_bytes());
-        result[2..10].copy_from_slice(&self.sequence.to_be_bytes());
+        result[2..IDENTIFIER_SIZE].copy_from_slice(&self.sequence.to_be_bytes());
         result
     }
 
-    fn from_bytes(bytes: &[u8; 10]) -> Self {
+    pub fn from_bytes(bytes: &[u8; IDENTIFIER_SIZE]) -> Self {
         Self {
             sender: u16::from_be_bytes(bytes[0..2].try_into().unwrap()),
-            sequence: u64::from_be_bytes(bytes[2..10].try_into().unwrap()),
+            sequence: u64::from_be_bytes(bytes[2..IDENTIFIER_SIZE].try_into().unwrap()),
         }
     }
 }
@@ -133,17 +151,17 @@ impl Message {
     }
     
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, io::Error> {
-        if bytes.len() < 12+64 {
+        if bytes.len() < MIN_MESSAGE_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData, 
-                "Message too short"
+                format!("Message too short: {} bytes, expected at least {}", bytes.len(), MIN_MESSAGE_SIZE)
             ));
         }
 
-        let id = Identifier::from_bytes(bytes[0..10].try_into().unwrap());
-        let sender: u16 = u16::from_be_bytes(bytes[10..12].try_into().unwrap());
-        let payload = MessageType::from_bytes(&bytes[12..bytes.len()-64])?;
-        let signature: [u8; 64] = bytes[bytes.len()-64..].try_into().unwrap();
+        let id = Identifier::from_bytes(bytes[0..IDENTIFIER_SIZE].try_into().unwrap());
+        let sender: u16 = u16::from_be_bytes(bytes[IDENTIFIER_SIZE..IDENTIFIER_SIZE+2].try_into().unwrap());
+        let payload = MessageType::from_bytes(&bytes[HEADER_SIZE..bytes.len()-SIGNATURE_SIZE])?;
+        let signature: [u8; SIGNATURE_SIZE] = bytes[bytes.len()-SIGNATURE_SIZE..].try_into().unwrap();
         
         Ok(Self {id, sender, payload, signature})
     }
@@ -156,9 +174,11 @@ impl Message {
 }
 
 
-pub async fn broadcast(destinations: &[String], message: &Message, socket: Arc<UdpSocket>) {
+pub async fn broadcast(destinations: &[String], message: &Message, socket: Arc<UdpSocket>) -> Result<(), io::Error> {
     let message_bytes = message.to_bytes();
     for dest in destinations {
-        _ = socket.send_to(&message_bytes, dest).await
+        socket.send_to(&message_bytes, dest).await
+            .map_err(|e| io::Error::new(io::ErrorKind::NetworkDown, format!("Failed to send to {}: {}", dest, e)))?;
     }
+    Ok(())
 }
